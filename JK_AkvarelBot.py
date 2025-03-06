@@ -7,7 +7,7 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import ChatMemberUpdated, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import ChatMemberUpdated, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, ChatPermissions
 
 # === НАСТРОЙКИ ===
 API_TOKEN = "8129897637:AAHV6aLm2wMYLx0a9SdvFq8Z01b02hW-GdM"
@@ -39,6 +39,16 @@ dp = Dispatcher(storage=MemoryStorage())
 router = Router()
 dp.include_router(router)
 
+# === ГЛАВНОЕ МЕНЮ ===
+main_menu = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="🏠 Регистрация")],
+        [KeyboardButton(text="📋 Список жильцов")],
+        [KeyboardButton(text="❌ Удалить меня")]
+    ],
+    resize_keyboard=True
+)
+
 # === ОБРАБОТКА НОВЫХ УЧАСТНИКОВ ===
 @router.chat_member()
 async def on_chat_member_update(event: ChatMemberUpdated):
@@ -48,28 +58,37 @@ async def on_chat_member_update(event: ChatMemberUpdated):
         text = (
             f"Привет, {mention_link}!\n"
             "Добро пожаловать в чат ЖК Акварель.\n"
-            "Пройди регистрацию: /register"
+            "Пройди регистрацию, чтобы писать в чате: /register\n"
+            "Если у вас есть вопросы, обратитесь к администраторам."
         )
-        await bot.send_message(user.id, text, parse_mode="HTML")
+        await bot.send_message(user.id, text, parse_mode="HTML", reply_markup=main_menu)
+        
+        # Ограничиваем права, пока не зарегистрируется
+        await bot.restrict_chat_member(
+            CHAT_ID, user.id,
+            ChatPermissions(can_send_messages=False)
+        )
+
+# === РАЗРЕШАЕМ ПИСАТЬ ПОСЛЕ РЕГИСТРАЦИИ ===
+async def allow_user_to_chat(user_id):
+    await bot.restrict_chat_member(
+        CHAT_ID, user_id,
+        ChatPermissions(can_send_messages=True)
+    )
 
 # === КОМАНДА СТАРТА ===
 @router.message(Command("start"))
 async def cmd_start(message: types.Message):
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🏠 Регистрация", callback_data="register")],
-        [InlineKeyboardButton(text="📋 Список жильцов", callback_data="list")],
-        [InlineKeyboardButton(text="❌ Удалить меня", callback_data="delete_me")]
-    ])
-    await message.answer("Привет! Выберите действие:", reply_markup=keyboard)
+    await message.answer("Я бот вашего дома ЖК Акварель по адресу Волжская 35А.\nВыберите действие:", reply_markup=main_menu)
 
 # === РЕГИСТРАЦИЯ ===
-@router.callback_query(lambda c: c.data == "register")
-async def cmd_register(callback: types.CallbackQuery, state: FSMContext):
-    cursor.execute("SELECT * FROM residents WHERE user_id = ?", (callback.from_user.id,))
+@router.message(lambda m: m.text == "🏠 Регистрация")
+async def cmd_register(message: types.Message, state: FSMContext):
+    cursor.execute("SELECT * FROM residents WHERE user_id = ?", (message.from_user.id,))
     if cursor.fetchone():
-        await callback.message.answer("Вы уже зарегистрированы!")
+        await message.answer("Вы уже зарегистрированы!")
         return
-    await callback.message.answer("Введите своё имя:")
+    await message.answer("Введите своё имя:")
     await state.set_state(Registration.waiting_for_name)
 
 @router.message(Registration.waiting_for_name)
@@ -95,44 +114,11 @@ async def process_phone(message: types.Message, state: FSMContext):
     conn.commit()
 
     mention_link = f'<a href="tg://user?id={message.from_user.id}">{name}</a>'
-    await message.answer(f"✅ Регистрация успешна!\nИмя: {mention_link}\nКвартира: {apartment}\nТелефон: {phone}", parse_mode="HTML")
+    await message.answer(f"✅ Регистрация успешна!\nИмя: {mention_link}\nКвартира: {apartment}\nТелефон: {phone}", parse_mode="HTML", reply_markup=main_menu)
     await state.clear()
 
+    # Разрешаем писать в чате после регистрации
+    await allow_user_to_chat(message.from_user.id)
+    
     for admin_id in ADMIN_IDS:
         await bot.send_message(admin_id, f"🔔 Новый житель зарегистрировался: {mention_link}, кв. {apartment}", parse_mode="HTML")
-
-# === СПИСОК ЖИЛЬЦОВ ===
-@router.callback_query(lambda c: c.data == "list")
-async def cmd_list(callback: types.CallbackQuery):
-    cursor.execute("SELECT name, apartment, phone FROM residents WHERE user_id = ?", (callback.from_user.id,))
-    if not cursor.fetchone():
-        await callback.message.answer("❌ Доступ запрещён! Только зарегистрированные пользователи могут смотреть список.")
-        return
-    
-    cursor.execute("SELECT name, apartment, phone, user_id FROM residents")
-    rows = cursor.fetchall()
-
-    text = "📋 <b>Список жильцов</b>:\n\n"
-    for r in rows:
-        name, apartment, phone, user_id = r
-        mention_link = f'<a href="tg://user?id={user_id}">{name}</a>'
-        text += f"🏠 Кв. {apartment} - {mention_link}, {phone}\n"
-
-    await callback.message.answer(text, parse_mode="HTML")
-
-# === УДАЛЕНИЕ ДАННЫХ ===
-@router.callback_query(lambda c: c.data == "delete_me")
-async def cmd_delete(callback: types.CallbackQuery):
-    cursor.execute("DELETE FROM residents WHERE user_id = ?", (callback.from_user.id,))
-    conn.commit()
-    await callback.message.answer("✅ Ваши данные удалены.")
-
-    for admin_id in ADMIN_IDS:
-        await bot.send_message(admin_id, f"🔴 {callback.from_user.full_name} удалил себя из базы.")
-
-async def main():
-    await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
-
-if __name__ == "__main__":
-    asyncio.run(main())
